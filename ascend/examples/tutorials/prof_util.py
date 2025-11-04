@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import torch
-# import torch_npu
+import torch_npu
 
 
 def profiler_wrapper(fn, *args, result_path="./result_profiling", skip_first=10,
