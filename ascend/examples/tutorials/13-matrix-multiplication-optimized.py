@@ -111,6 +111,83 @@ def matmul_kernel_diagonal(
         tl.store(mat_c + mat_c_offset, mat_c_block.to(tl.bfloat16), mask = mat_c_mask)
 
 
+# Kernel using swizzle2d for optimized memory access patterns
+@triton.jit
+def matmul_kernel_swizzle2d(
+        mat_a, mat_b, mat_c,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        num_cores: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+
+    '''
+    使用 swizzle2d 优化内存访问模式
+    swizzle2d 可以改善内存访问的局部性，减少 bank conflicts
+    '''
+    NUM_BLOCKS_M = triton.cdiv(M, BLOCK_M)
+    NUM_BLOCKS_N = triton.cdiv(N, BLOCK_N)
+    NUM_BLOCKS = NUM_BLOCKS_M * NUM_BLOCKS_N
+
+    # Use swizzle2d for block allocation
+    for block_idx in range(pid, NUM_BLOCKS, num_cores):
+        task_m_idx = block_idx // NUM_BLOCKS_N
+        task_n_idx = block_idx % NUM_BLOCKS_N
+        m_start = task_m_idx * BLOCK_M
+        n_start = task_n_idx * BLOCK_N
+
+        mat_c_block = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            # Use swizzle2d to optimize memory access pattern for mat_a
+            m_range = tl.arange(0, BLOCK_M)
+            k_range = tl.arange(0, BLOCK_K)
+            m_swizzled, k_swizzled = tl.swizzle2d(m_range, k_range,
+                                                   size_i=BLOCK_M, size_j=BLOCK_K, size_g=16)
+
+            mat_a_offset = ((m_start + m_swizzled) * K)[:, None] + (
+                k_start + k_range
+            )[None, :]
+            mat_a_mask = ((m_start + m_range) < M)[:, None] & (
+                (k_start + k_range) < K
+            )[None, :]
+            mat_a_block = tl.load(mat_a + mat_a_offset, mask=mat_a_mask, other=0.0)
+            tl.compile_hint(mat_a_block, "dot_pad_only_k")
+
+            # Use swizzle2d to optimize memory access pattern for mat_b
+            n_range = tl.arange(0, BLOCK_N)
+            k_swizzled_b, n_swizzled = tl.swizzle2d(k_range, n_range,
+                                                     size_i=BLOCK_K, size_j=BLOCK_N, size_g=16)
+
+            mat_b_offset = ((k_start + k_range) * N)[:, None] + (
+                n_start + n_swizzled
+            )[None, :]
+            mat_b_mask = ((k_start + k_range) < K)[:, None] & (
+                (n_start + n_range) < N
+            )[None, :]
+            mat_b_block = tl.load(mat_b + mat_b_offset, mask=mat_b_mask, other=0.0)
+            tl.compile_hint(mat_b_block, "dot_pad_only_k")
+
+            mat_c_block = tl.dot(mat_a_block, mat_b_block, mat_c_block)
+
+        # Store result with swizzle2d
+        m_range = tl.arange(0, BLOCK_M)
+        n_range = tl.arange(0, BLOCK_N)
+        m_swizzled_out, n_swizzled_out = tl.swizzle2d(m_range, n_range,
+                                                       size_i=BLOCK_M, size_j=BLOCK_N, size_g=16)
+
+        mat_c_offset = ((m_start + m_swizzled_out) * N)[:, None] + (
+            n_start + n_swizzled_out
+        )[None, :]
+        mat_c_mask = ((m_start + m_range) < M)[:, None] & (
+            (n_start + n_range) < N
+        )[None, :]
+        tl.store(mat_c + mat_c_offset, mat_c_block.to(tl.bfloat16), mask=mat_c_mask)
+
+
 # Kernel using sequential core allocation strategy (traditional approach)
 @triton.jit
 def matmul_kernel_sequential(
@@ -179,7 +256,7 @@ def matmul_kernel_sequential(
 def triton_matmul(
     mat_a,
     mat_b,
-    kernel_type='diagonal',  # 'diagonal' or 'sequential'
+    kernel_type='diagonal',  # 'diagonal', 'sequential', or 'swizzle2d'
     BLOCK_M=128,
     BLOCK_N=256,
     BLOCK_K=256,
@@ -191,7 +268,9 @@ def triton_matmul(
     Args:
         mat_a: Input matrix A
         mat_b: Input matrix B
-        kernel_type: 'diagonal' for optimized diagonal allocation, 'sequential' for traditional approach
+        kernel_type: 'diagonal' for optimized diagonal allocation,
+                    'sequential' for traditional approach,
+                    'swizzle2d' for swizzle2d optimized memory access
         BLOCK_M, BLOCK_N, BLOCK_K: Block sizes for tiling
         BLOCK_TRESHHOLD: Threshold for diagonal allocation (only used for diagonal kernel)
 
@@ -217,8 +296,14 @@ def triton_matmul(
             m, n, k, num_cores,
             BLOCK_M, BLOCK_N, BLOCK_K
         )
+    elif kernel_type == 'swizzle2d':
+        matmul_kernel_swizzle2d[(num_cores,)](
+            mat_a, mat_b, mat_c,
+            m, n, k, num_cores,
+            BLOCK_M, BLOCK_N, BLOCK_K
+        )
     else:
-        raise ValueError(f"Unknown kernel_type: {kernel_type}. Must be 'diagonal' or 'sequential'")
+        raise ValueError(f"Unknown kernel_type: {kernel_type}. Must be 'diagonal', 'sequential', or 'swizzle2d'")
 
     return mat_c
 
@@ -298,23 +383,45 @@ if __name__ == "__main__":
     # Dictionary to store profiling result paths
     profiling_results = {}
 
-    # Run benchmarks for both kernel types
+    # Run benchmarks for all three kernel types
+    print("\nRunning benchmarks for three different optimization strategies:")
+    print("  1. Sequential: Traditional row-major allocation")
+    print("  2. Diagonal: Optimized diagonal allocation for better cache utilization")
+    print("  3. Swizzle2D: Using swizzle2d for optimized memory access patterns")
+    print("=" * 80)
+
     run_benchmark(M, K, N, 'sequential', profiling_results,
                  BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_TRESHHOLD)
     run_benchmark(M, K, N, 'diagonal', profiling_results,
                  BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_TRESHHOLD)
+    run_benchmark(M, K, N, 'swizzle2d', profiling_results,
+                 BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_TRESHHOLD)
 
     # Compare and report profiling results
     print("\n" + "=" * 80)
-    print("Performance Comparison: Diagonal vs Sequential Core Allocation")
+    print("Performance Comparison: Three Optimization Strategies")
     print("=" * 80)
 
     results = compare_profiling_results(profiling_results)
     print_profiling_summary(results,
-                          title="Matrix Multiplication: Diagonal vs Sequential Allocation")
+                          title="Matrix Multiplication: Sequential vs Diagonal vs Swizzle2D")
 
-    print("\nKey Benefits of Diagonal Allocation:")
-    print("  1. Reduced bank conflicts by distributing memory access patterns")
-    print("  2. Improved L2 cache utilization for large right matrices")
-    print("  3. Better performance when NUM_BLOCKS_M and NUM_BLOCKS_N >= BLOCK_TRESHHOLD")
+    print("\nOptimization Strategy Summary:")
+    print("-" * 80)
+    print("Sequential Allocation:")
+    print("  - Traditional row-major block allocation")
+    print("  - Simple and straightforward")
+    print("  - May suffer from bank conflicts and cache misses on large matrices")
+    print()
+    print("Diagonal Allocation:")
+    print("  - Optimized diagonal block allocation")
+    print("  - Reduces bank conflicts by distributing memory access patterns")
+    print("  - Improved L2 cache utilization for large right matrices")
+    print("  - Better performance when NUM_BLOCKS_M and NUM_BLOCKS_N >= BLOCK_TRESHHOLD")
+    print()
+    print("Swizzle2D Allocation:")
+    print("  - Uses tl.swizzle2d to optimize memory access patterns")
+    print("  - Improves memory access locality")
+    print("  - Reduces bank conflicts through access pattern transformation")
+    print("  - Particularly effective for certain memory layouts")
     print("=" * 80 + "\n")
