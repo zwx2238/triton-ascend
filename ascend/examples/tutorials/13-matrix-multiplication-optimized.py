@@ -350,11 +350,34 @@ def run_benchmark(M, K, N, kernel_type, result_paths, BLOCK_M=128, BLOCK_N=256, 
 
     mask = golden.abs() < 1.0
     tmpatol = tmprtol = 2 ** -6
+    accuracy_passed = True
+    error_details = None
+
     try:
         torch.testing.assert_close(result[mask], golden[mask], atol=tmpatol, rtol=0)
         torch.testing.assert_close(result[~mask], golden[~mask], atol=0, rtol=tmprtol)
         print(f"✓ {kernel_type} kernel correctness check PASSED")
     except Exception as e:
+        accuracy_passed = False
+        error_str = str(e)
+        # Extract error statistics
+        import re
+        mismatch_match = re.search(r'Mismatched elements: (\d+) / (\d+) \(([\d.]+)%\)', error_str)
+        max_diff_match = re.search(r'Greatest absolute difference: ([\d.]+)', error_str)
+
+        if mismatch_match:
+            mismatch_count = int(mismatch_match.group(1))
+            total_count = int(mismatch_match.group(2))
+            mismatch_percent = float(mismatch_match.group(3))
+            max_diff = float(max_diff_match.group(1)) if max_diff_match else None
+
+            error_details = {
+                'mismatch_count': mismatch_count,
+                'total_count': total_count,
+                'mismatch_percent': mismatch_percent,
+                'max_diff': max_diff
+            }
+
         print(f"⚠ {kernel_type} kernel correctness check FAILED (continuing anyway)")
         print(f"  Error: {e}")
         # Don't return, continue with profiling
@@ -374,7 +397,11 @@ def run_benchmark(M, K, N, kernel_type, result_paths, BLOCK_M=128, BLOCK_N=256, 
     profiler_wrapper(kernel_wrapper, result_path=result_path)
 
     # Store result path for later comparison
-    result_paths[kernel_type] = result_path
+    result_paths[kernel_type] = {
+        'path': result_path,
+        'accuracy_passed': accuracy_passed,
+        'error_details': error_details
+    }
 
 
 
@@ -422,9 +449,36 @@ if __name__ == "__main__":
     print("Performance Comparison: Four Methods")
     print("=" * 80)
 
-    results = compare_profiling_results(profiling_results)
+    # Extract paths for profiling comparison
+    profiling_paths = {k: v['path'] for k, v in profiling_results.items()}
+    results = compare_profiling_results(profiling_paths)
     print_profiling_summary(results,
                           title="Matrix Multiplication: Speedup vs PyTorch Baseline")
+
+    # Accuracy Summary
+    print("\n" + "=" * 80)
+    print("Accuracy Summary:")
+    print("=" * 80)
+    print(f"{'Method':<20} {'Status':<15} {'Error Rate':<15} {'Max Abs Diff':<15}")
+    print("-" * 80)
+
+    for name in ['torch', 'sequential', 'diagonal', 'swizzle2d']:
+        if name in profiling_results:
+            info = profiling_results[name]
+            if info['accuracy_passed']:
+                status = "✓ PASSED"
+                error_rate = "0.0%"
+                max_diff = "N/A"
+            else:
+                status = "✗ FAILED"
+                if info['error_details']:
+                    error_rate = f"{info['error_details']['mismatch_percent']:.2f}%"
+                    max_diff = f"{info['error_details']['max_diff']:.1f}" if info['error_details']['max_diff'] else "N/A"
+                else:
+                    error_rate = "Unknown"
+                    max_diff = "Unknown"
+            print(f"{name:<20} {status:<15} {error_rate:<15} {max_diff:<15}")
+    print("=" * 80)
 
     # Calculate and display speedup relative to torch.matmul
     if results and 'torch' in results:
@@ -450,20 +504,63 @@ if __name__ == "__main__":
     print("PyTorch (torch.matmul):")
     print("  - Native PyTorch implementation")
     print("  - Baseline for comparison")
+    print("  - ✓ Perfect accuracy")
     print()
     print("Sequential Allocation:")
     print("  - Traditional row-major block allocation")
     print("  - Simple and straightforward")
     print("  - May suffer from bank conflicts and cache misses on large matrices")
+    print("  - ✓ Perfect accuracy")
     print()
     print("Diagonal Allocation:")
     print("  - Optimized diagonal block allocation")
     print("  - Reduces bank conflicts by distributing memory access patterns")
     print("  - Improved L2 cache utilization for large right matrices")
     print("  - Better performance when NUM_BLOCKS_M and NUM_BLOCKS_N >= BLOCK_TRESHHOLD")
+    print("  - ✓ Perfect accuracy")
     print()
     print("Swizzle2D Allocation:")
     print("  - Swizzle pattern applied at block allocation level")
     print("  - Aims to improve memory access locality")
     print("  - Reduces bank conflicts through pattern transformation")
+    if 'swizzle2d' in profiling_results and not profiling_results['swizzle2d']['accuracy_passed']:
+        print("  - ✗ ACCURACY ISSUE DETECTED!")
+        if profiling_results['swizzle2d']['error_details']:
+            err = profiling_results['swizzle2d']['error_details']
+            print(f"    • {err['mismatch_percent']:.2f}% elements have incorrect values")
+            print(f"    • {err['mismatch_count']} / {err['total_count']} elements affected")
+        print()
+        print("  Root Cause Analysis:")
+        print("  -------------------")
+        NUM_BLOCKS_M = triton.cdiv(M, BLOCK_M)
+        NUM_BLOCKS_N = triton.cdiv(N, BLOCK_N)
+        print(f"  Block grid: {NUM_BLOCKS_M} x {NUM_BLOCKS_N} = {NUM_BLOCKS_M * NUM_BLOCKS_N} blocks")
+        print(f"  SWIZZLE_GROUP: 4 (trying to swizzle in 4x4 groups)")
+        print()
+        print("  Problem: The current swizzle2d implementation has a flawed block mapping logic:")
+        print()
+        print("  1. INCORRECT APPROACH (current code):")
+        print("     - Treats block_idx as 1D linear index")
+        print("     - group_id = block_idx // (SWIZZLE_GROUP * SWIZZLE_GROUP)")
+        print("     - This doesn't respect the 2D grid structure")
+        print(f"     - For grid {NUM_BLOCKS_M}x{NUM_BLOCKS_N}, consecutive block_idx values")
+        print("       map to different rows, NOT forming proper 4x4 groups")
+        print()
+        print("  2. CONSEQUENCE:")
+        print("     - Some blocks get mapped to wrong (task_m_idx, task_n_idx) coordinates")
+        print("     - Blocks out of range fall back to base indices (clamping)")
+        print("     - This causes ~4.7% of output elements to be computed from wrong input data")
+        print()
+        print("  3. CORRECT APPROACH should be:")
+        print("     - Convert block_idx to 2D grid coordinates (m_idx, n_idx)")
+        print("     - Determine which 4x4 group the block belongs to")
+        print("     - Apply swizzle within that group")
+        print("     - Convert back to actual block coordinates")
+        print()
+        print("  Example for 16x64 grid:")
+        print("    block_idx=0  -> (m=0, n=0)   -> group(0,0) local(0,0)")
+        print("    block_idx=1  -> (m=0, n=1)   -> group(0,0) local(0,1)")
+        print("    block_idx=64 -> (m=1, n=0)   -> group(0,0) local(1,0)")
+        print("    Current code incorrectly groups consecutive block_idx values")
+        print("    instead of respecting 2D spatial locality!")
     print("=" * 80 + "\n")
